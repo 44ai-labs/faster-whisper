@@ -603,6 +603,315 @@ class BatchedInferencePipeline:
         self.last_speech_timestamp = 0.0
 
 
+class BatchedInferenceParallel():
+    def __init__(
+        self,
+        model,
+    ):
+        self.model: WhisperModel = model
+
+    def prepare_transcribe(
+        self,
+        audios: List[Union[str, BinaryIO, np.ndarray]]
+    ):
+        sampling_rate = self.model.feature_extractor.sampling_rate
+        audio_chunks = [
+            decode_audio(audio, sampling_rate=sampling_rate)
+            if not isinstance(audio, np.ndarray)
+            else audio
+            for audio in audios
+        ]
+
+        features = (
+            [self.model.feature_extractor(chunk)[..., :-1] for chunk in audio_chunks]
+        )
+        return features
+
+
+    def transcribe(
+        self,
+        audios: list[Union[str, BinaryIO, np.ndarray]], # changed
+        languages: list[str], # changed
+        task: str = "transcribe",
+        log_progress: bool = False,
+        beam_size: int = 5,
+        best_of: int = 5,
+        patience: float = 1,
+        length_penalty: float = 1,
+        repetition_penalty: float = 1,
+        no_repeat_ngram_size: int = 0,
+        temperature: Union[float, List[float], Tuple[float, ...]] = [
+            0.0,
+            0.2,
+            0.4,
+            0.6,
+            0.8,
+            1.0,
+        ],
+        compression_ratio_threshold: Optional[float] = 2.4,
+        log_prob_threshold: Optional[float] = -1.0,
+        no_speech_threshold: Optional[float] = 0.6,
+        condition_on_previous_text: bool = True,
+        prompt_reset_on_temperature: float = 0.5,
+        initial_prompts: list[Union[str, Iterable[int]]] = [], # changed
+        prefix: Optional[str] = None,
+        suppress_blank: bool = True,
+        suppress_tokens: Optional[List[int]] = [-1],
+        without_timestamps: bool = True,
+        max_initial_timestamp: float = 1.0,
+        word_timestamps: bool = False,
+        prepend_punctuations: str = "\"'“¿([{-",
+        append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
+        multilingual: bool = False,
+        vad_filter: bool = True,
+        vad_parameters: Optional[Union[dict, VadOptions]] = None,
+        max_new_tokens: Optional[int] = None,
+        chunk_length: Optional[int] = None,
+        clip_timestamps: Optional[List[dict]] = None,
+        hallucination_silence_threshold: Optional[float] = None,
+        batch_size: int = 8,
+        hotwords: Optional[str] = None,
+        language_detection_threshold: Optional[float] = 0.5,
+        language_detection_segments: int = 1,
+    ) -> Tuple[Iterable[Segment], TranscriptionInfo]:
+        if len(initial_prompts) != len(audios):
+            raise ValueError(
+                f"Number of initial prompts ({len(initial_prompts)}) "
+                f"does not match the number of audio files ({len(audios)})."
+            )
+        if len(languages) != len(audios):
+            raise ValueError(
+                f"Number of languages ({len(languages)}) "
+                f"does not match the number of audio files ({len(audios)})."
+            )
+        features = self.prepare_transcribe(audios)
+
+        all_language_probs = None
+        # detecting the language if not provided
+
+        tokenizers = []
+        for language, task in zip(languages, [task] * len(audios)):
+            tokenizer = Tokenizer(
+                self.model.hf_tokenizer,
+                self.model.model.is_multilingual,
+                task=task,
+                language=language,
+            )
+            tokenizers.append(tokenizer) 
+
+        features = (
+            np.stack([pad_or_trim(feature) for feature in features]) if features else []
+        )
+
+        options = TranscriptionOptions(
+            beam_size=beam_size,
+            best_of=best_of,
+            patience=patience,
+            length_penalty=length_penalty,
+            repetition_penalty=repetition_penalty,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            log_prob_threshold=log_prob_threshold,
+            no_speech_threshold=no_speech_threshold,
+            compression_ratio_threshold=compression_ratio_threshold,
+            temperatures=(
+                temperature[:1]
+                if isinstance(temperature, (list, tuple))
+                else [temperature]
+            ),
+            initial_prompt=initial_prompts,
+            prefix=prefix,
+            suppress_blank=suppress_blank,
+            suppress_tokens=(
+                get_suppressed_tokens(tokenizer, suppress_tokens)
+                if suppress_tokens
+                else suppress_tokens
+            ),
+            prepend_punctuations=prepend_punctuations,
+            append_punctuations=append_punctuations,
+            max_new_tokens=max_new_tokens,
+            hotwords=hotwords,
+            word_timestamps=word_timestamps,
+            hallucination_silence_threshold=None,
+            condition_on_previous_text=False,
+            clip_timestamps=clip_timestamps,
+            prompt_reset_on_temperature=0.5,
+            multilingual=multilingual,
+            without_timestamps=without_timestamps,
+            max_initial_timestamp=0.0,
+        )
+
+        info = TranscriptionInfo(
+            language=language,
+            language_probability=1,
+            duration=0.0, # warning
+            duration_after_vad=0.0, # warning
+            transcription_options=options,
+            vad_options=vad_parameters,
+            all_language_probs=all_language_probs,
+        )
+        segments = self._segments_generator(
+            features,
+            tokenizers,
+            options,
+            initial_prompts=initial_prompts,
+            batch_size=batch_size,
+        )
+
+        return segments, info
+
+    def _segments_generator(
+        self, features, tokenizers, options, initial_prompts, batch_size=8
+    ):
+        seg_idx = 0
+        for i in range(0, len(features), batch_size):
+            results = self.forward(
+                features[i : i + batch_size],
+                tokenizers[i : i + batch_size],
+                options,
+                initial_prompts[i : i + batch_size],
+            )
+            for result in results:
+                for segment in result:
+                    seg_idx += 1
+                    yield Segment(
+                        seek=segment["seek"],
+                        id=seg_idx,
+                        text=segment["text"],
+                        start=round(segment["start"], 3),
+                        end=round(segment["end"], 3),
+                        words=(
+                            None
+                            if not options.word_timestamps
+                            else [Word(**word) for word in segment["words"]]
+                        ),
+                        tokens=segment["tokens"],
+                        avg_logprob=segment["avg_logprob"],
+                        no_speech_prob=segment["no_speech_prob"],
+                        compression_ratio=segment["compression_ratio"],
+                        temperature=options.temperatures[0],
+                    )
+
+    
+    def forward(self, features, tokenizers, options, initial_prompts):
+        _encoder_output, outputs = self.generate_segment_batched(
+            features, tokenizers, options, initial_prompts
+        )
+
+        segmented_outputs = []
+        for i, output in enumerate(outputs):
+            duration = features.shape[-1] * self.model.feature_extractor.time_per_frame
+            segmented_outputs.append(
+                [
+                    dict(
+                        text=tokenizers[i].decode(output["tokens"]),
+                        avg_logprob=output["avg_logprob"],
+                        no_speech_prob=output["no_speech_prob"],
+                        tokens=output["tokens"],
+                        start=0.0,
+                        end=duration,
+                        compression_ratio=get_compression_ratio(
+                            tokenizers[i].decode(output["tokens"])
+                        ),
+                        seek=0,
+                    )
+                ]
+            )
+        if options.word_timestamps:
+            # TODO: could be broken for batched inference
+            print("Warning: Word timestamps are not supported in batched inference")
+
+        return segmented_outputs
+
+    def generate_segment_batched(
+        self,
+        features: np.ndarray,
+        tokenizers: list[Tokenizer],
+        options: TranscriptionOptions,
+        initial_prompts: list[str]
+    ):
+
+        prompts = []
+        for i, initial_prompt in enumerate(initial_prompts):
+            if initial_prompt is not None:
+                prompt = self.model.get_prompt(
+                    tokenizers[i],
+                    previous_tokens=(
+                        tokenizers[i].encode(initial_prompt)
+                        if initial_prompt is not None
+                        else []
+                    ),
+                    without_timestamps=options.without_timestamps,
+                    hotwords=options.hotwords,
+                )
+                prompts.append(prompt)
+            else:
+                prompts.append(
+                    self.model.get_prompt(
+                        tokenizers[i],
+                        previous_tokens=[],
+                        without_timestamps=options.without_timestamps,
+                        hotwords=options.hotwords,
+                    )
+                )
+
+        max_length = self.model.max_length
+        for prompt in prompts:
+            if options.max_new_tokens is not None:
+                max_length = len(prompt) + options.max_new_tokens
+            else:
+                max_length = self.model.max_length
+
+            if max_length > self.model.max_length:
+                raise ValueError(
+                    f"The length of the prompt is {len(prompt)}, and the `max_new_tokens` "
+                    f"{max_length - len(prompt)}. Thus, the combined length of the prompt "
+                    f"and `max_new_tokens` is: {max_length}. This exceeds the "
+                    f"`max_length` of the Whisper model: {self.model.max_length}. "
+                    "You should either reduce the length of your prompt, or "
+                    "reduce the value of `max_new_tokens`, "
+                    f"so that their combined length is less that {self.model.max_length}."
+                    f"Prompt: {prompt}, Max length: {max_length}, Max length of model: {self.model.max_length}"
+                )
+            
+        print(f"Max length: {max_length}, Max length of model: {self.model.max_length}")
+
+        encoder_output = self.model.encode(features)
+
+        # language already added to prompt here from tokenizer
+
+        results = self.model.model.generate(
+            encoder_output,
+            prompts,
+            beam_size=options.beam_size,
+            patience=options.patience,
+            length_penalty=options.length_penalty,
+            max_length=max_length,
+            suppress_blank=options.suppress_blank,
+            suppress_tokens=options.suppress_tokens,
+            return_scores=True,
+            return_no_speech_prob=True,
+            sampling_temperature=options.temperatures[0],
+            repetition_penalty=options.repetition_penalty,
+            no_repeat_ngram_size=options.no_repeat_ngram_size,
+        )
+
+        output = []
+        for result in results:
+            # return scores
+            seq_len = len(result.sequences_ids[0])
+            cum_logprob = result.scores[0] * (seq_len**options.length_penalty)
+
+            output.append(
+                dict(
+                    avg_logprob=cum_logprob / (seq_len + 1),
+                    no_speech_prob=result.no_speech_prob,
+                    tokens=result.sequences_ids[0],
+                )
+            )
+
+        return encoder_output, output
+
+
 class WhisperModel:
     def __init__(
         self,
@@ -1379,9 +1688,11 @@ class WhisperModel:
         # to the CPU since we don't know which GPU will handle the next job.
         to_cpu = self.model.device == "cuda" and len(self.model.device_index) > 1
 
+        print(f"features : {features.shape}, to_cpu: {to_cpu}")
         if features.ndim == 2:
             features = np.expand_dims(features, 0)
         features = get_ctranslate2_storage(features)
+        print(f"features after get_ctranslate2_storage: {features.shape}")
 
         return self.model.encode(features, to_cpu=to_cpu)
 
