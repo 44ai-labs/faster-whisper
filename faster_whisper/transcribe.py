@@ -846,7 +846,6 @@ class BatchedInferenceParallel():
             if previous_tokens:
                 prompts[i].append(tokenizer.sot_prev)
                 if previous_tokens:
-                    print(f"prompt {i} has previous tokens: {previous_tokens[-(self.model.max_length // 2 - 1) :]}")
                     prompts[i].extend(previous_tokens[-(self.model.max_length // 2 - 1) :])
                     prev_lens[i] = len(previous_tokens[-(self.model.max_length // 2 - 1) :])
 
@@ -899,8 +898,6 @@ class BatchedInferenceParallel():
             initial_prompts,
             without_timestamps=options.without_timestamps,
         )
-        for i, prompt in enumerate(prompts):
-            print(f"Prompt {i} (len={len(prompt)}): {prompt}")
 
         max_length = self.model.max_length
         for prompt in prompts:
@@ -920,8 +917,6 @@ class BatchedInferenceParallel():
                     f"so that their combined length is less that {self.model.max_length}."
                     f"Prompt: {prompt}, Max length: {max_length}, Max length of model: {self.model.max_length}"
                 )
-            
-        print(f"Max length: {max_length}, Max length of model: {self.model.max_length}")
 
         encoder_output = self.model.encode(features)
 
@@ -1736,11 +1731,9 @@ class WhisperModel:
         # to the CPU since we don't know which GPU will handle the next job.
         to_cpu = self.model.device == "cuda" and len(self.model.device_index) > 1
 
-        print(f"features : {features.shape}, to_cpu: {to_cpu}")
         if features.ndim == 2:
             features = np.expand_dims(features, 0)
         features = get_ctranslate2_storage(features)
-        print(f"features after get_ctranslate2_storage: {features.shape}")
 
         return self.model.encode(features, to_cpu=to_cpu)
 
