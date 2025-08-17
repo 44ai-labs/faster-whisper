@@ -603,6 +603,16 @@ class BatchedInferencePipeline:
         self.last_speech_timestamp = 0.0
 
 
+def _space_pad_id(tok: Tokenizer) -> int:
+    # Try to find a single whitespace-like token; prefer plain space.
+    for cand in (" ", "  ", "\n", "\t"):
+        ids = tok.encode(cand)
+        if len(ids) >= 1:
+            return ids[0]  # use the first token id and repeat it
+    # last resort (if your tokenizer is exotic); consider avoiding this if you can
+    return tok.eot
+
+
 class BatchedInferenceParallel():
     def __init__(
         self,
@@ -822,6 +832,56 @@ class BatchedInferenceParallel():
 
         return segmented_outputs
 
+    def get_prompts(
+        self,
+        tokenizers: list[Tokenizer],
+        initial_prompts: List[str],
+        without_timestamps: bool = False,
+    ) -> list[List[int]]:
+        prompts = [[] for _ in range(len(tokenizers))]
+
+        prev_lens = [0] * len(tokenizers)
+        for i, tokenizer, initial_prompt in zip(range(0, len(tokenizers)), tokenizers, initial_prompts):
+            previous_tokens = tokenizer.encode(initial_prompt) if initial_prompt else []
+            if previous_tokens:
+                prompts[i].append(tokenizer.sot_prev)
+                if previous_tokens:
+                    print(f"prompt {i} has previous tokens: {previous_tokens[-(self.model.max_length // 2 - 1) :]}")
+                    prompts[i].extend(previous_tokens[-(self.model.max_length // 2 - 1) :])
+                    prev_lens[i] = len(previous_tokens[-(self.model.max_length // 2 - 1) :])
+
+            prompts[i].extend(tokenizer.sot_sequence)
+
+            if without_timestamps:
+                prompts[i].append(tokenizer.no_timestamps)
+
+        # align them
+        # sot needs to be at the same position for the complete batch
+        max_prev_len = max(prev_lens) if prev_lens else 0
+        for i, prompt in enumerate(prompts):
+            if prev_lens[i] < max_prev_len + 1:
+                if prompt[0] == tokenizers[i].sot_prev:
+                    # left-pad with whitespace token ids
+                    pad = max_prev_len + 1 - prev_lens[i]
+                    pad_id = _space_pad_id(tokenizers[i])
+                    prompts[i] = [prompt[0]] + [pad_id] * pad + prompt[1:]
+                elif prompt[0] == tokenizers[i].sot:
+                    # left-pad with whitespace token ids
+                    if max_prev_len > 0:
+                        pad = max(max_prev_len + 1, 0)
+                        pad_id = _space_pad_id(tokenizers[i])
+                        prompts[i] = [tokenizers[i].sot_prev] + [pad_id] * pad + prompt
+                else:
+                    raise ValueError(
+                        f"Unexpected prompt {i} start token: {prompt[0]} "
+                        f"for tokenizer {tokenizers[i].language}"
+                    )
+
+        expected = prompts[0].index(tokenizers[0].sot)
+        for p, tok in zip(prompts, tokenizers):
+            assert p.index(tok.sot) == expected, "SOT misaligned"
+        return prompts
+
     def generate_segment_batched(
         self,
         features: np.ndarray,
@@ -829,30 +889,18 @@ class BatchedInferenceParallel():
         options: TranscriptionOptions,
         initial_prompts: list[str]
     ):
+        
+        # without timestamps
+        # it is approx 3x slower with timestamps
+        # we do alignment later
 
-        prompts = []
-        for i, initial_prompt in enumerate(initial_prompts):
-            if initial_prompt is not None:
-                prompt = self.model.get_prompt(
-                    tokenizers[i],
-                    previous_tokens=(
-                        tokenizers[i].encode(initial_prompt)
-                        if initial_prompt is not None
-                        else []
-                    ),
-                    without_timestamps=options.without_timestamps,
-                    hotwords=options.hotwords,
-                )
-                prompts.append(prompt)
-            else:
-                prompts.append(
-                    self.model.get_prompt(
-                        tokenizers[i],
-                        previous_tokens=[],
-                        without_timestamps=options.without_timestamps,
-                        hotwords=options.hotwords,
-                    )
-                )
+        prompts = self.get_prompts(
+            tokenizers,
+            initial_prompts,
+            without_timestamps=options.without_timestamps,
+        )
+        for i, prompt in enumerate(prompts):
+            print(f"Prompt {i} (len={len(prompt)}): {prompt}")
 
         max_length = self.model.max_length
         for prompt in prompts:
