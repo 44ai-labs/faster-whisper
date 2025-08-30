@@ -663,6 +663,7 @@ class BatchedInferenceParallel():
         no_speech_threshold: Optional[float] = 0.6,
         condition_on_previous_text: bool = True,
         prompt_reset_on_temperature: float = 0.5,
+        filler_prompts: list[str] = [],
         initial_prompts: list[Union[str, Iterable[int]]] = [], # changed
         prefix: Optional[str] = None,
         suppress_blank: bool = True,
@@ -764,13 +765,14 @@ class BatchedInferenceParallel():
             tokenizers,
             options,
             initial_prompts=initial_prompts,
+            filler_prompts=filler_prompts,
             batch_size=batch_size,
         )
 
         return segments, info
 
     def _segments_generator(
-        self, features, tokenizers, options, initial_prompts, batch_size=8
+        self, features, tokenizers, options, initial_prompts, filler_prompts, batch_size=8
     ):
         seg_idx = 0
         for i in range(0, len(features), batch_size):
@@ -779,6 +781,7 @@ class BatchedInferenceParallel():
                 tokenizers[i : i + batch_size],
                 options,
                 initial_prompts[i : i + batch_size],
+                filler_prompts=filler_prompts[i : i + batch_size],
             )
             for result in results:
                 for segment in result:
@@ -802,9 +805,9 @@ class BatchedInferenceParallel():
                     )
 
     
-    def forward(self, features, tokenizers, options, initial_prompts):
+    def forward(self, features, tokenizers, options, initial_prompts, filler_prompts):
         _encoder_output, outputs = self.generate_segment_batched(
-            features, tokenizers, options, initial_prompts
+            features, tokenizers, options, initial_prompts, filler_prompts=filler_prompts
         )
 
         segmented_outputs = []
@@ -836,9 +839,16 @@ class BatchedInferenceParallel():
         self,
         tokenizers: list[Tokenizer],
         initial_prompts: List[str],
+        filler_prompts: List[str],  # used for filling up prompts instead of empty prompts
         without_timestamps: bool = False,
     ) -> list[List[int]]:
         prompts = [[] for _ in range(len(tokenizers))]
+
+        if len(filler_prompts) != len(tokenizers):
+            raise ValueError(
+                f"Number of filler prompts ({len(filler_prompts)}) "
+                f"does not match the number of tokenizers ({len(tokenizers)})."
+            )
 
         prev_lens = [0] * len(tokenizers)
         for i, tokenizer, initial_prompt in zip(range(0, len(tokenizers)), tokenizers, initial_prompts):
@@ -859,17 +869,34 @@ class BatchedInferenceParallel():
         max_prev_len = max(prev_lens) if prev_lens else 0
         for i, prompt in enumerate(prompts):
             if prev_lens[i] < max_prev_len + 1:
+                # Calculate required padding
+                pad = max_prev_len + 1 - prev_lens[i]
+                
                 if prompt[0] == tokenizers[i].sot_prev:
-                    # left-pad with whitespace token ids
-                    pad = max_prev_len + 1 - prev_lens[i]
-                    pad_id = _space_pad_id(tokenizers[i])
-                    prompts[i] = [prompt[0]] + [pad_id] * pad + prompt[1:]
+                    # Use filler prompt tokens for padding
+                    filler_tokens = tokenizers[i].encode(filler_prompts[i]) if filler_prompts[i] else []
+                    # If filler tokens are not enough, use space padding for the rest
+                    if len(filler_tokens) < pad:
+                        pad_id = _space_pad_id(tokenizers[i])
+                        space_padding = [pad_id] * (pad - len(filler_tokens))
+                        prompts[i] = [prompt[0], *filler_tokens, *space_padding, *prompt[1:]]
+                    else:
+                        # If we have enough or more filler tokens, just use what we need
+                        prompts[i] = [prompt[0], *filler_tokens[:pad], *prompt[1:]]
+                
                 elif prompt[0] == tokenizers[i].sot:
-                    # left-pad with whitespace token ids
+                    # left-pad with filler tokens or whitespace if needed
                     if max_prev_len > 0:
                         pad = max(max_prev_len + 1, 0)
-                        pad_id = _space_pad_id(tokenizers[i])
-                        prompts[i] = [tokenizers[i].sot_prev] + [pad_id] * pad + prompt
+                        filler_tokens = tokenizers[i].encode(filler_prompts[i]) if filler_prompts[i] else []
+                        # If filler tokens are not enough, use space padding for the rest
+                        if len(filler_tokens) < pad:
+                            pad_id = _space_pad_id(tokenizers[i])
+                            space_padding = [pad_id] * (pad - len(filler_tokens))
+                            prompts[i] = [tokenizers[i].sot_prev, *filler_tokens, *space_padding, *prompt]
+                        else:
+                            # If we have enough or more filler tokens, just use what we need
+                            prompts[i] = [tokenizers[i].sot_prev, *filler_tokens[:pad], *prompt]
                 else:
                     raise ValueError(
                         f"Unexpected prompt {i} start token: {prompt[0]} "
@@ -886,7 +913,8 @@ class BatchedInferenceParallel():
         features: np.ndarray,
         tokenizers: list[Tokenizer],
         options: TranscriptionOptions,
-        initial_prompts: list[str]
+        initial_prompts: list[str],
+        filler_prompts: list[str],
     ):
         
         # without timestamps
@@ -897,6 +925,7 @@ class BatchedInferenceParallel():
             tokenizers,
             initial_prompts,
             without_timestamps=options.without_timestamps,
+            filler_prompts=filler_prompts
         )
 
         max_length = self.model.max_length
