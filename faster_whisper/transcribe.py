@@ -854,6 +854,7 @@ class BatchedInferenceParallel():
         for i, tokenizer, initial_prompt in zip(range(0, len(tokenizers)), tokenizers, initial_prompts):
             previous_tokens = tokenizer.encode(initial_prompt) if initial_prompt else []
             if previous_tokens:
+                # here we add the sot_prev token
                 prompts[i].append(tokenizer.sot_prev)
                 if previous_tokens:
                     prompts[i].extend(previous_tokens[-(self.model.max_length // 2 - 1) :])
@@ -872,6 +873,9 @@ class BatchedInferenceParallel():
                 # Calculate required padding
                 pad = max_prev_len + 1 - prev_lens[i]
                 
+                # Get newline token for separation
+                newline_token = tokenizers[i].encode("\n")[0] if tokenizers[i].encode("\n") else _space_pad_id(tokenizers[i])
+
                 if prompt[0] == tokenizers[i].sot_prev:
                     # Use filler prompt tokens for padding
                     filler_tokens = tokenizers[i].encode(filler_prompts[i]) if filler_prompts[i] else []
@@ -879,10 +883,10 @@ class BatchedInferenceParallel():
                     if len(filler_tokens) < pad:
                         pad_id = _space_pad_id(tokenizers[i])
                         space_padding = [pad_id] * (pad - len(filler_tokens))
-                        prompts[i] = [prompt[0], *filler_tokens, *space_padding, *prompt[1:]]
+                        prompts[i] = [prompt[0], *filler_tokens, *space_padding, newline_token, *prompt[1:]]
                     else:
                         # If we have enough or more filler tokens, just use what we need
-                        prompts[i] = [prompt[0], *filler_tokens[:pad], *prompt[1:]]
+                        prompts[i] = [prompt[0], *filler_tokens[:pad], newline_token, *prompt[1:]]
                 
                 elif prompt[0] == tokenizers[i].sot:
                     # left-pad with filler tokens or whitespace if needed
@@ -893,10 +897,10 @@ class BatchedInferenceParallel():
                         if len(filler_tokens) < pad:
                             pad_id = _space_pad_id(tokenizers[i])
                             space_padding = [pad_id] * (pad - len(filler_tokens))
-                            prompts[i] = [tokenizers[i].sot_prev, *filler_tokens, *space_padding, *prompt]
+                            prompts[i] = [tokenizers[i].sot_prev, *filler_tokens, *space_padding, newline_token, *prompt]
                         else:
                             # If we have enough or more filler tokens, just use what we need
-                            prompts[i] = [tokenizers[i].sot_prev, *filler_tokens[:pad], *prompt]
+                            prompts[i] = [tokenizers[i].sot_prev, *filler_tokens[:pad], newline_token, *prompt]
                 else:
                     raise ValueError(
                         f"Unexpected prompt {i} start token: {prompt[0]} "
@@ -906,6 +910,11 @@ class BatchedInferenceParallel():
         expected = prompts[0].index(tokenizers[0].sot)
         for p, tok in zip(prompts, tokenizers):
             assert p.index(tok.sot) == expected, "SOT misaligned"
+        
+        # # print all prompts
+        # for i, (prompt, tok) in enumerate(zip(prompts, tokenizers)):
+        #     decoded_prompt = tok.decode(prompt)
+        #     print(f"Prompt {i} ({tok.language}): {decoded_prompt}")
         return prompts
 
     def generate_segment_batched(
